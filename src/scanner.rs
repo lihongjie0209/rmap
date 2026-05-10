@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,7 +145,8 @@ async fn port_phase(
                     pb.inc(1);
                     let (service, version) = if detect_services {
                         if let (PortStatus::Open, Some(s)) = (&status, stream) {
-                            detect_service(s, port, svc_timeout).await
+                            let addr = SocketAddr::new(ip, port);
+                            detect_service(s, addr, svc_timeout).await
                         } else {
                             (None, None)
                         }

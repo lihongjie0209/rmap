@@ -37,6 +37,8 @@ struct ServiceProbe {
     probe_bytes: Vec<u8>,
     /// Ports this probe is recommended for
     ports: Vec<u16>,
+    /// Rarity 1–9: higher = more specialized for its specific ports
+    rarity: u8,
     match_rules: Vec<MatchRule>,
 }
 
@@ -68,56 +70,117 @@ impl ServiceDetector {
 
 /// Detect the service running on an already-open `TcpStream`.
 ///
+/// `addr` is needed to reconnect for fallback probes when a server closes
+/// the connection after the first probe (e.g. PostgreSQL vs GetRequest).
+///
 /// Returns `(service_name, version_string)`.
 pub async fn detect_service(
     stream: TcpStream,
-    port: u16,
+    addr: std::net::SocketAddr,
     det_timeout: Duration,
 ) -> (Option<String>, Option<String>) {
     let detector = ServiceDetector::global();
-    detect_with(stream, port, det_timeout, detector).await
+    detect_with(stream, addr, det_timeout, detector).await
 }
 
 async fn detect_with(
     mut stream: TcpStream,
-    port: u16,
+    addr: std::net::SocketAddr,
     det_timeout: Duration,
     detector: &ServiceDetector,
 ) -> (Option<String>, Option<String>) {
+    let port = addr.port();
+    let active_timeout = det_timeout.min(Duration::from_millis(2000));
+
     // -- Phase 1: passive banner ------------------------------------------
     // Some services (SSH, FTP, SMTP) immediately send a banner on connect.
     let passive_dur = det_timeout.min(Duration::from_millis(1500));
     let banner = read_banner(&mut stream, passive_dur).await;
 
-    // Try to match the passive banner against the NULL probe rules.
+    // Try to match the passive banner against the NULL probe rules first,
+    // then against all port-matched active probe rules.
     if let Some(ref b) = banner {
-        if let Some(result) = try_match_probes(b, port, &detector.probes, true) {
+        if let Some(result) = try_match_null_probe(b, &detector.probes) {
+            return result;
+        }
+        if let Some(result) = try_match_port_probes(b, port, &detector.probes, None) {
             return result;
         }
     }
 
-    // -- Phase 2: active probe -------------------------------------------
-    // Find the best probe for this port (skip the NULL probe = index 0).
-    let probe_bytes = find_probe_bytes(port, &detector.probes);
-    if probe_bytes.is_empty() {
-        // No active probe available; return any passive partial match.
-        return (None, None);
+    // -- Phase 2: active probes ------------------------------------------
+    // Collect candidates: the best port-specific probe + generic fallbacks.
+    // We try each probe in order, stopping at the first successful match.
+    let (best_bytes, best_idx) = find_probe(port, &detector.probes);
+    let fallback_probes: &[(&[u8], &str)] = &[
+        // PostgreSQL startup packet (minimal, no parameters).
+        // Triggers a binary error response that the SSLSessionReq probe rules can match.
+        (b"\x00\x00\x00\x08\x00\x03\x00\x00", "postgresql_startup"),
+    ];
+
+    // Try the best nmap probe first.
+    if !best_bytes.is_empty() {
+        if let Some(result) = try_active_probe(
+            &mut stream, port, &best_bytes, best_idx, active_timeout, &detector.probes,
+        ).await {
+            return result;
+        }
     }
 
-    // Send probe, read response.
-    let active_timeout = det_timeout.min(Duration::from_millis(2000));
-    if timeout(active_timeout, stream.write_all(&probe_bytes)).await.is_err() {
-        return (None, None);
-    }
-    let response = read_banner(&mut stream, active_timeout).await;
+    // Try custom fallback probes for services that don't respond to standard probes.
+    for &(probe_bytes, _name) in fallback_probes {
+        // Skip if this probe was already used (same bytes as best probe).
+        if probe_bytes == best_bytes.as_slice() {
+            continue;
+        }
+        // Reconnect — the previous probe may have caused the server to close the connection.
+        let new_stream = match timeout(active_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => s,
+            _ => continue,
+        };
+        stream = new_stream;
 
-    if let Some(ref r) = response {
-        if let Some(result) = try_match_probes(r, port, &detector.probes, false) {
+        if let Some(result) = try_active_probe(
+            &mut stream, port, probe_bytes, None, active_timeout, &detector.probes,
+        ).await {
             return result;
         }
     }
 
     (None, None)
+}
+
+/// Send a probe payload, read the response, and attempt to match it.
+async fn try_active_probe(
+    stream: &mut TcpStream,
+    port: u16,
+    probe_bytes: &[u8],
+    sent_probe_idx: Option<usize>,
+    active_timeout: Duration,
+    probes: &[ServiceProbe],
+) -> Option<(Option<String>, Option<String>)> {
+    if timeout(active_timeout, stream.write_all(probe_bytes)).await.is_err() {
+        return None;
+    }
+    let response = read_banner(stream, active_timeout).await;
+    let r = response.as_deref()?;
+
+    // Try the probe we sent first (regardless of port filter).
+    if let Some(idx) = sent_probe_idx {
+        if let Some(result) = try_match_single_probe(r, &probes[idx]) {
+            return Some(result);
+        }
+    }
+    // Try any other probes that cover this port.
+    if let Some(result) = try_match_port_probes(r, port, probes, sent_probe_idx) {
+        return Some(result);
+    }
+    // Try NULL probe rules.
+    if let Some(result) = try_match_null_probe(r, probes) {
+        return Some(result);
+    }
+    // Last resort: try ALL active probe rules (catches services on non-standard ports).
+    try_match_any_active_probe(r, probes, sent_probe_idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -133,52 +196,100 @@ async fn read_banner(stream: &mut TcpStream, dur: Duration) -> Option<String> {
     }
 }
 
-/// Walk the probe list and try each rule against `data` for `port`.
-/// If `null_only` is true, only the NULL probe is tried (for passive banners).
-fn try_match_probes(
+/// Try only the NULL probe's match rules (for passive banners or active fallback).
+fn try_match_null_probe(
+    data: &str,
+    probes: &[ServiceProbe],
+) -> Option<(Option<String>, Option<String>)> {
+    for probe in probes {
+        if probe.probe_bytes.is_empty() {
+            return try_match_single_probe(data, probe);
+        }
+    }
+    None
+}
+
+/// Try match rules of a single probe against `data`.
+fn try_match_single_probe(
+    data: &str,
+    probe: &ServiceProbe,
+) -> Option<(Option<String>, Option<String>)> {
+    for rule in &probe.match_rules {
+        if let Ok(Some(caps)) = rule.pattern.captures(data) {
+            let version = rule.version_template.as_ref().map(|tpl| {
+                apply_version_template(tpl, &caps)
+            });
+            return Some((Some(rule.service.clone()), version));
+        }
+    }
+    None
+}
+
+/// Try all active probes (non-NULL) whose ports list includes `port`,
+/// optionally skipping `skip_idx` (the probe we already tried).
+fn try_match_port_probes(
     data: &str,
     port: u16,
     probes: &[ServiceProbe],
-    null_only: bool,
+    skip_idx: Option<usize>,
 ) -> Option<(Option<String>, Option<String>)> {
-    for probe in probes {
-        // Respect null_only: the NULL probe has empty probe_bytes.
-        if null_only && !probe.probe_bytes.is_empty() {
+    for (i, probe) in probes.iter().enumerate() {
+        if probe.probe_bytes.is_empty() {
+            continue; // skip NULL probe
+        }
+        if Some(i) == skip_idx {
             continue;
         }
-        // For active probes, only use probes applicable to this port.
-        if !null_only && !probe.probe_bytes.is_empty() && !probe.ports.contains(&port) {
-            continue;
-        }
-        for rule in &probe.match_rules {
-            if let Ok(Some(caps)) = rule.pattern.captures(data) {
-                let version = rule.version_template.as_ref().map(|tpl| {
-                    apply_version_template(tpl, &caps)
-                });
-                return Some((Some(rule.service.clone()), version));
+        if probe.ports.contains(&port) {
+            if let Some(result) = try_match_single_probe(data, probe) {
+                return Some(result);
             }
         }
     }
     None
 }
 
-/// Find probe bytes for the given port; return empty vec if only NULL applies.
-fn find_probe_bytes(port: u16, probes: &[ServiceProbe]) -> Vec<u8> {
-    for probe in probes {
-        if probe.probe_bytes.is_empty() {
-            continue; // skip NULL probe
+/// Last-resort: try ALL active probe rules without port filtering.
+/// Used when a service runs on a non-standard port not listed in any probe.
+fn try_match_any_active_probe(
+    data: &str,
+    probes: &[ServiceProbe],
+    skip_idx: Option<usize>,
+) -> Option<(Option<String>, Option<String>)> {
+    for (i, probe) in probes.iter().enumerate() {
+        if probe.probe_bytes.is_empty() || Some(i) == skip_idx {
+            continue;
         }
-        if probe.ports.contains(&port) {
-            return probe.probe_bytes.clone();
+        if let Some(result) = try_match_single_probe(data, probe) {
+            return Some(result);
         }
     }
-    // Fall back to GetRequest if no specific probe matched
-    for probe in probes {
+    None
+}
+
+/// Find the best probe for `port`. Returns `(probe_bytes, probe_index)`.
+/// Among all probes whose ports list includes `port`, prefers the highest-rarity
+/// (most specialized) probe, since that's most likely the correct service.
+/// Falls back to GetRequest as a universal fallback for unmatched ports.
+fn find_probe(port: u16, probes: &[ServiceProbe]) -> (Vec<u8>, Option<usize>) {
+    // Find the highest-rarity probe whose port list includes this port.
+    let best = probes
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.probe_bytes.is_empty() && p.ports.contains(&port))
+        .max_by_key(|(_, p)| p.rarity);
+
+    if let Some((i, p)) = best {
+        return (p.probe_bytes.clone(), Some(i));
+    }
+
+    // Fallback: use GetRequest (handles HTTP on any port).
+    for (i, probe) in probes.iter().enumerate() {
         if probe.name == "GetRequest" {
-            return probe.probe_bytes.clone();
+            return (probe.probe_bytes.clone(), Some(i));
         }
     }
-    vec![]
+    (vec![], None)
 }
 
 /// Replace `$1`, `$2`, … in `template` with regex capture groups.
@@ -224,6 +335,8 @@ fn parse_probes(raw: &str) -> Vec<ServiceProbe> {
 
         if let Some(ports_str) = line.strip_prefix("ports ") {
             probe.ports = parse_port_list(ports_str);
+        } else if let Some(r) = line.strip_prefix("rarity ") {
+            probe.rarity = r.trim().parse().unwrap_or(1);
         } else if line.starts_with("match ") || line.starts_with("softmatch ") {
             let rest = if line.starts_with("softmatch ") {
                 &line["softmatch ".len()..]
@@ -264,6 +377,7 @@ fn parse_probe_header(line: &str) -> Option<ServiceProbe> {
         name: name.to_owned(),
         probe_bytes,
         ports: vec![],
+        rarity: 1,
         match_rules: vec![],
     })
 }
@@ -588,5 +702,28 @@ mod tests {
         let caps = re.captures("2.5 something").unwrap().unwrap();
         assert_eq!(apply_version_template("v$1.$2", &caps), "v2.5");
         assert_eq!(apply_version_template("ver $2", &caps), "ver 5");
+    }
+
+    /// The redis-server probe must be found for port 16379.
+    #[test]
+    fn redis_probe_found_for_16379() {
+        let probes = parse_probes(PROBES_RAW);
+        let (bytes, idx) = find_probe(16379, &probes);
+        assert!(!bytes.is_empty(), "no probe found for port 16379");
+        let probe = &probes[idx.unwrap()];
+        assert_eq!(probe.name, "redis-server", "wrong probe selected: {}", probe.name);
+    }
+
+    /// The redis INFO response must match the redis-server probe's match rule.
+    #[test]
+    fn redis_info_response_matches() {
+        let probes = parse_probes(PROBES_RAW);
+        let redis_probe = probes.iter().find(|p| p.name == "redis-server").expect("redis-server probe");
+        // Simulate a Redis INFO response with CRLF line endings
+        let response = "$5762\r\n# Server\r\nredis_version:7.4.7\r\nredis_git_sha1:00000000\r\n";
+        let result = try_match_single_probe(response, redis_probe);
+        assert!(result.is_some(), "redis INFO response not matched; probe has {} rules", redis_probe.match_rules.len());
+        let (svc, _ver) = result.unwrap();
+        assert_eq!(svc.as_deref(), Some("redis"));
     }
 }
