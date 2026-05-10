@@ -90,9 +90,11 @@ jobs:
         shell: bash
         run: |
           ARCHIVE="rmap-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -czf "$ARCHIVE" \
-            -C "target/${{ matrix.target }}/release" "${{ matrix.bin }}" \
-            README.md
+          mkdir -p _dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" _dist/
+          cp README.md _dist/
+          tar -czf "$ARCHIVE" -C _dist "${{ matrix.bin }}" README.md
+          rm -rf _dist
           echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Package (zip)
