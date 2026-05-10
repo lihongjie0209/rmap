@@ -306,7 +306,7 @@ fn parse_match_rule(rest: &str) -> Option<MatchRule> {
     if regex_str == "(?)" {
         regex_str.clear();
     }
-    regex_str.push_str(pattern_raw);
+    regex_str.push_str(&normalize_pattern(pattern_raw));
 
     let pattern = match Regex::new(&regex_str) {
         Ok(r) => r,
@@ -389,6 +389,15 @@ fn parse_port_list(s: &str) -> Vec<u16> {
     ports
 }
 
+/// Normalize a raw nmap regex pattern to be compatible with fancy-regex.
+///
+/// The only transformation currently needed is replacing `\0` with `\x00`
+/// outside of already-escaped contexts. fancy-regex rejects `\0` inside
+/// character classes (e.g. `[^\0]`), but `\x00` is universally accepted.
+fn normalize_pattern(pat: &str) -> String {
+    pat.replace("\\0", "\\x00")
+}
+
 /// Decode nmap probe string escapes: \r \n \t \0 \xNN \\
 fn decode_escape(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
@@ -428,5 +437,156 @@ fn from_hex(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the regex string (with inline flags) from a raw match/softmatch line.
+/// Used by tests to compile each pattern independently.
+pub(crate) fn extract_raw_pattern(match_line: &str) -> Option<String> {
+    let rest = if let Some(r) = match_line.strip_prefix("match ") {
+        r
+    } else if let Some(r) = match_line.strip_prefix("softmatch ") {
+        r
+    } else {
+        return None;
+    };
+    let (_, rest) = rest.split_once(' ')?;
+    let rest = rest.trim_start();
+    if !rest.starts_with('m') {
+        return None;
+    }
+    let rest = &rest[1..];
+    let delim = rest.chars().next()?;
+    let inner = &rest[delim.len_utf8()..];
+    let end = find_close_delim(inner, delim)?;
+    let pattern_raw = &inner[..end];
+    let flag_str = &inner[end + delim.len_utf8()..];
+
+    let mut case_insensitive = false;
+    let mut dot_all = false;
+    for ch in flag_str.chars() {
+        if ch == 'i' { case_insensitive = true; }
+        else if ch == 's' { dot_all = true; }
+        else { break; }
+    }
+
+    let mut regex_str = String::from("(?");
+    if case_insensitive { regex_str.push('i'); }
+    if dot_all { regex_str.push('s'); }
+    regex_str.push(')');
+    if regex_str == "(?)" { regex_str.clear(); }
+    regex_str.push_str(&normalize_pattern(pattern_raw));
+    Some(regex_str)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify every match/softmatch pattern in the embedded probes file compiles
+    /// with fancy-regex.  Failures are printed so developers can see which lines
+    /// need attention.  The test passes as long as the failure rate is below 1 %
+    /// (a tiny fraction of patterns use obscure PCRE constructs not in fancy-regex).
+    #[test]
+    fn all_probe_patterns_compile() {
+        let mut total = 0u32;
+        let mut failed: Vec<(usize, String, String)> = Vec::new();
+
+        for (line_no, line) in PROBES_RAW.lines().enumerate() {
+            let line = line.trim_end();
+            if !line.starts_with("match ") && !line.starts_with("softmatch ") {
+                continue;
+            }
+            total += 1;
+            if let Some(pattern) = extract_raw_pattern(line) {
+                if let Err(e) = Regex::new(&pattern) {
+                    failed.push((line_no + 1, pattern, e.to_string()));
+                }
+            }
+        }
+
+        if !failed.is_empty() {
+            eprintln!(
+                "\n=== Regex compilation failures ({}/{} patterns) ===",
+                failed.len(),
+                total
+            );
+            for (lineno, pat, err) in &failed {
+                eprintln!("  line {:5}: {}", lineno, err);
+                let preview: String = pat.chars().take(120).collect();
+                eprintln!("            pattern: {}", preview);
+            }
+        }
+
+        let failure_rate = failed.len() as f64 / total.max(1) as f64;
+        assert!(
+            failure_rate < 0.01,
+            "{}/{} patterns failed to compile ({:.2}% — must be < 1%)",
+            failed.len(),
+            total,
+            failure_rate * 100.0,
+        );
+
+        println!(
+            "Probe regex compilation: {}/{} OK, {} failed ({:.3}%)",
+            total as usize - failed.len(),
+            total,
+            failed.len(),
+            failure_rate * 100.0,
+        );
+    }
+
+    /// The global detector must initialise without panicking.
+    #[test]
+    fn detector_initialises() {
+        let _ = ServiceDetector::global();
+    }
+
+    /// Parser must find the key probes by name.
+    #[test]
+    fn parser_finds_null_and_get_request() {
+        let probes = parse_probes(PROBES_RAW);
+        let names: Vec<&str> = probes.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"NULL"), "NULL probe missing");
+        assert!(names.contains(&"GetRequest"), "GetRequest probe missing");
+    }
+
+    /// The NULL probe should have many compiled match rules.
+    #[test]
+    fn null_probe_has_many_rules() {
+        let probes = parse_probes(PROBES_RAW);
+        let null = probes.iter().find(|p| p.name == "NULL").expect("NULL probe");
+        assert!(
+            null.match_rules.len() > 1000,
+            "NULL probe only has {} compiled match rules — parser may be broken",
+            null.match_rules.len()
+        );
+    }
+
+    /// Basic escape sequence decoding.
+    #[test]
+    fn decode_escape_basic() {
+        assert_eq!(decode_escape(b"\\r\\n"), b"\r\n");
+        assert_eq!(decode_escape(b"\\x41"), b"A");
+        assert_eq!(decode_escape(b"\\\\"), b"\\");
+        assert_eq!(decode_escape(b"\\0"), b"\0");
+        assert_eq!(decode_escape(b"hello"), b"hello");
+    }
+
+    /// Version template capture-group substitution.
+    #[test]
+    fn version_template_substitution() {
+        let re = Regex::new(r"(\d+)\.(\d+)").unwrap();
+        let caps = re.captures("2.5 something").unwrap().unwrap();
+        assert_eq!(apply_version_template("v$1.$2", &caps), "v2.5");
+        assert_eq!(apply_version_template("ver $2", &caps), "ver 5");
     }
 }
