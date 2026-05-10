@@ -98,10 +98,10 @@ async fn icmp_phase(
     let mut results: HashMap<IpAddr, HostResult> = HashMap::new();
 
     while let Some((ip, alive)) = futs.next().await {
-        if alive {
+        if alive && !results.contains_key(&ip) {
             alive_ips.push(ip);
         }
-        results.insert(ip, HostResult { ip, alive: Some(alive), ports: vec![] });
+        results.entry(ip).or_insert(HostResult { ip, alive: Some(alive), ports: vec![] });
     }
 
     pb.finish_and_clear();

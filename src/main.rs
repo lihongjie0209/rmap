@@ -111,6 +111,10 @@ fn parse_targets(raw: &[String]) -> Result<Vec<IpAddr>> {
         ips.push(s.parse()?);
     }
 
+    // Deduplicate while preserving order
+    let mut seen = std::collections::HashSet::new();
+    ips.retain(|ip| seen.insert(*ip));
+
     Ok(ips)
 }
 
