@@ -51,9 +51,9 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     timeout: u64,
 
-    /// Display only open ports in the output
+    /// Show all ports including closed/filtered (default: open only)
     #[arg(long)]
-    open_only: bool,
+    all: bool,
 
     /// Output format: plain (default), json, or tui (interactive table)
     #[arg(short, long, default_value = "plain")]
@@ -205,7 +205,7 @@ async fn main() -> Result<()> {
         timeout_ms: args.timeout,
         skip_icmp: args.port_only,
         skip_ports: args.icmp_only,
-        open_only: args.open_only,
+        open_only: !args.all,
     };
 
     let results = scanner::run_scan(&config).await;
@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
     } else if args.output == "tui" {
         tui::run_tui(results).map_err(|e| anyhow::anyhow!("TUI error: {e}"))?;
     } else {
-        print_plain(&results, args.open_only);
+        print_plain(&results, !args.all);
         let up = results.iter().filter(|h| h.alive.unwrap_or(true)).count();
         let open_total: usize = results
             .iter()

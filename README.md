@@ -56,7 +56,7 @@ Options:
       --port-only              Skip ICMP, scan ports on all targets
   -c, --concurrency <N>        Max concurrent probes  [default: 1000]
       --timeout <MS>           Per-probe timeout in ms  [default: 1000]
-      --open-only              Show only open ports
+      --all                    Show all ports including closed/filtered (default: open only)
   -o, --output <FORMAT>        plain | json | tui  [default: plain]
   -h, --help                   Print help
   -V, --version                Print version
@@ -72,7 +72,7 @@ sudo rmap 192.168.1.1 -p 22,80,443,3389
 sudo rmap 192.168.1.0/24
 
 # Port-only (no ICMP required)
-rmap 10.0.0.1-20 --port-only -p 80,443,8080 --open-only
+rmap 10.0.0.1-20 --port-only -p 80,443,8080
 
 # Interactive TUI with expand/collapse
 sudo rmap 192.168.1.0/24 -o tui
