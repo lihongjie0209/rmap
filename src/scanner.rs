@@ -8,6 +8,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::Semaphore;
 
 use crate::icmp::ping;
+use crate::service::detect_service;
 use crate::tcp::scan_port;
 use crate::types::{HostResult, PortResult, PortStatus, ScanConfig};
 
@@ -57,6 +58,7 @@ pub async fn run_scan(config: &ScanConfig) -> Vec<HostResult> {
         timeout,
         config.concurrency,
         config.open_only,
+        config.detect_services,
         &multi,
         &mut results,
     )
@@ -114,6 +116,7 @@ async fn port_phase(
     timeout: Duration,
     concurrency: usize,
     open_only: bool,
+    detect_services: bool,
     multi: &MultiProgress,
     results: &mut HashMap<IpAddr, HostResult>,
 ) {
@@ -125,6 +128,9 @@ async fn port_phase(
     let pb = make_progress_bar(multi, total, "PORTS", "green");
     let sem = Arc::new(Semaphore::new(concurrency));
 
+    // Service detection uses a tighter per-port timeout (max 3s extra per port).
+    let svc_timeout = Duration::from_millis(2000);
+
     let mut futs: FuturesUnordered<_> = hosts
         .iter()
         .flat_map(|&ip| {
@@ -135,18 +141,27 @@ async fn port_phase(
                 let pb = pb.clone();
                 async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let status = scan_port(ip, port, timeout).await;
+                    let (status, stream) = scan_port(ip, port, timeout).await;
                     pb.inc(1);
-                    (ip, port, status)
+                    let (service, version) = if detect_services {
+                        if let (PortStatus::Open, Some(s)) = (&status, stream) {
+                            detect_service(s, port, svc_timeout).await
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
+                    (ip, port, status, service, version)
                 }
             })
         })
         .collect();
 
-    while let Some((ip, port, status)) = futs.next().await {
+    while let Some((ip, port, status, service, version)) = futs.next().await {
         if let Some(host) = results.get_mut(&ip) {
             if !open_only || status == PortStatus::Open {
-                host.ports.push(PortResult { port, status });
+                host.ports.push(PortResult { port, status, service, version });
             }
         }
     }

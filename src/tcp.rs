@@ -8,20 +8,20 @@ use crate::types::PortStatus;
 
 /// Attempt a TCP connect to determine port status.
 ///
-/// - `Open`     — connection succeeded
-/// - `Closed`   — connection actively refused (RST)
-/// - `Filtered` — timeout or other network error (no response / dropped)
-pub async fn scan_port(ip: IpAddr, port: u16, timeout_dur: Duration) -> PortStatus {
+/// Returns `(status, stream)` where `stream` is `Some` only when the port is Open,
+/// so the caller can reuse the connection for service detection.
+pub async fn scan_port(ip: IpAddr, port: u16, timeout_dur: Duration) -> (PortStatus, Option<TcpStream>) {
     let addr = SocketAddr::new(ip, port);
     match timeout(timeout_dur, TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => PortStatus::Open,
+        Ok(Ok(stream)) => (PortStatus::Open, Some(stream)),
         Ok(Err(e)) => {
-            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+            let status = if e.kind() == std::io::ErrorKind::ConnectionRefused {
                 PortStatus::Closed
             } else {
                 PortStatus::Filtered
-            }
+            };
+            (status, None)
         }
-        Err(_) => PortStatus::Filtered,
+        Err(_) => (PortStatus::Filtered, None),
     }
 }

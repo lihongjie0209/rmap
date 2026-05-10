@@ -216,6 +216,8 @@ fn make_row(
                 Cell::from(alive_str.to_owned()).style(alive_fg),
                 Cell::from(format!("{}/{}", open_count, total)),
                 Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
             ])
             .style(sel_bg)
         }
@@ -242,12 +244,17 @@ fn make_row(
                 Style::default().fg(Color::Gray)
             };
 
+            let svc = port.service.as_deref().unwrap_or("").to_owned();
+            let ver = port.version.as_deref().unwrap_or("").to_owned();
+
             Row::new(vec![
                 Cell::from(""),
                 Cell::from(format!("  └─ {}", port.port)).style(port_fg),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(port.status.to_string()).style(status_fg),
+                Cell::from(svc),
+                Cell::from(ver),
             ])
             .style(row_style)
         }
@@ -294,6 +301,8 @@ fn render(state: &TuiState, f: &mut ratatui::Frame, inner_height: usize) {
         Cell::from("Status"),
         Cell::from("Ports"),
         Cell::from("Port Status"),
+        Cell::from("Service"),
+        Cell::from("Version"),
     ])
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
     .height(1);
@@ -306,6 +315,8 @@ fn render(state: &TuiState, f: &mut ratatui::Frame, inner_height: usize) {
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(11),
+            Constraint::Length(12),
+            Constraint::Min(10),
         ],
     )
     .header(header)

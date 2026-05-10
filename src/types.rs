@@ -24,6 +24,10 @@ impl std::fmt::Display for PortStatus {
 pub struct PortResult {
     pub port: u16,
     pub status: PortStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,4 +49,6 @@ pub struct ScanConfig {
     /// Skip port scan (ICMP-only mode)
     pub skip_ports: bool,
     pub open_only: bool,
+    /// Run service/version detection on open ports
+    pub detect_services: bool,
 }

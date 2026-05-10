@@ -1,5 +1,6 @@
 mod icmp;
 mod scanner;
+mod service;
 mod tcp;
 mod tui;
 mod types;
@@ -54,6 +55,10 @@ struct Args {
     /// Show all ports including closed/filtered (default: open only)
     #[arg(long)]
     all: bool,
+
+    /// Disable service/version detection (faster for large scans)
+    #[arg(long)]
+    no_banners: bool,
 
     /// Output format: plain (default), json, or tui (interactive table)
     #[arg(short, long, default_value = "plain")]
@@ -163,10 +168,16 @@ fn print_plain(results: &[crate::types::HostResult], _open_only: bool) {
             continue;
         }
 
-        println!("  {:>6}  {:<10}", "PORT", "STATUS");
-        println!("  {:->6}  {:-<10}", "", "");
+        println!("  {:>6}  {:<10}  {:<16}  {}", "PORT", "STATUS", "SERVICE", "VERSION");
+        println!("  {:->6}  {:-<10}  {:-<16}  {:-<20}", "", "", "", "");
         for pr in &host.ports {
-            println!("  {:>6}  {:<10}", pr.port, pr.status);
+            println!(
+                "  {:>6}  {:<10}  {:<16}  {}",
+                pr.port,
+                pr.status,
+                pr.service.as_deref().unwrap_or(""),
+                pr.version.as_deref().unwrap_or(""),
+            );
         }
     }
 }
@@ -210,6 +221,7 @@ async fn main() -> Result<()> {
         skip_icmp: args.port_only,
         skip_ports: args.icmp_only,
         open_only: !args.all,
+        detect_services: !args.no_banners,
     };
 
     let results = scanner::run_scan(&config).await;
